@@ -1,0 +1,25 @@
+Cell Coverage: a cell-coverage companion app for OsmAnd
+Licensed under the GNU General Public License, version 3 or (at your option)
+any later version. See LICENSE.
+
+This project includes or is derived from the following works.
+
+OsmAnd AIDL client API (osmand-api/)
+  Copied unmodified, apart from its build file, from
+  https://github.com/osmandapp/OsmAnd at commit f4f96bb.
+  Copyright the OsmAnd developers. GNU General Public License v3.
+  The app links this module, which is why the app as a whole is GPL-3.0-or-later.
+
+Tower Collector (reference/towercollector/, and code ported from it)
+  From https://github.com/zamojski/TowerCollector at commit e31296b
+  (version 3.0.2). Copyright the Tower Collector authors.
+  Mozilla Public License 2.0; see reference/towercollector/LICENSE.txt.
+  Files ported from Tower Collector keep their MPL-2.0 header and live together
+  in the app's `collector` package. MPL-2.0 section 3.3 permits distributing
+  them as part of this GPL-licensed larger work.
+
+OsmAnd sources kept for reference only (reference/osmand/)
+  From https://github.com/osmandapp/OsmAnd, GNU General Public License v3.
+  They are read to understand OsmAnd's side of the API and are never compiled
+  into the app. OsmAndAidlHelper-from-api-demo.java is OsmAnd's sample client,
+  from https://github.com/osmandapp/osmand-api-demo, MIT License.
