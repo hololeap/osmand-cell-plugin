@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-package io.github.hololeap.cellcoverage.core
+package io.github.hololeap.cellcoverage.core.model
 
 import kotlin.test.Test
 import kotlin.test.assertEquals

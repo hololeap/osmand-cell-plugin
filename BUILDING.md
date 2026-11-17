@@ -20,6 +20,15 @@ resolves the Android plugin even when it only runs `:core` tasks.
 Gradle 8.11.1 runs on JDK 17 to 23. A newer JDK (25, say) as the only one
 installed will refuse to start it; point `JAVA_HOME` at an older one.
 
+The estimator tests take about a minute and a half; everything else is quick.
+Two optional extras run only when asked:
+
+    # The full model-comparison table (about 8 minutes)
+    ESTIMATOR_COMPARE=1 ./gradlew :core:test --tests '*compareModels*' -i
+
+    # A GeoPackage of synthetic data to open in QGIS
+    SAMPLE_GPKG=/tmp/sample.gpkg ./gradlew :core:test --tests '*SampleGeoPackage*'
+
 ## Installing the Android SDK
 
 `scripts/cloud-setup.sh` is the whole install: it downloads Google's

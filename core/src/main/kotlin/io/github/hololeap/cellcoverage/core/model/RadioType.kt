@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-package io.github.hololeap.cellcoverage.core
+package io.github.hololeap.cellcoverage.core.model
 
 /** Radio access technology of a cell, with the generation shown to the user. */
 enum class RadioType(val generation: Int) {
@@ -11,13 +11,13 @@ enum class RadioType(val generation: Int) {
     NR(5);
 
     companion object {
-        /** Parses the names used in Tower Collector's CSV export ("net_type" column). */
+        /** Parses the names Tower Collector writes in the `net_type` CSV column. */
         fun fromName(name: String): RadioType? =
             when (name.trim().uppercase()) {
                 "GSM" -> GSM
                 "CDMA" -> CDMA
                 "UMTS", "WCDMA" -> WCDMA
-                "TDSCDMA", "TD-SCDMA" -> TDSCDMA
+                "TD-SCDMA", "TDSCDMA" -> TDSCDMA
                 "LTE" -> LTE
                 "NR", "5G" -> NR
                 else -> null

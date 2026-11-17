@@ -17,6 +17,8 @@ kotlin {
 
 dependencies {
     testImplementation(kotlin("test"))
+    // A real SQLite, to check that the GeoPackage schema is valid SQL and reads back.
+    testImplementation("org.xerial:sqlite-jdbc:3.46.1.3")
 }
 
 tasks.test {
