@@ -1,0 +1,989 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+package info.zamojski.soft.towercollector;
+
+import android.app.Notification;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.ServiceInfo;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.location.LocationProvider;
+import android.os.Binder;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.os.PowerManager;
+import android.os.PowerManager.WakeLock;
+import android.telephony.CellInfo;
+import android.telephony.CellLocation;
+import android.telephony.NeighboringCellInfo;
+import android.telephony.PhoneStateListener;
+import android.telephony.SignalStrength;
+import android.telephony.SubscriptionInfo;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
+
+import org.greenrobot.eventbus.EventBus;
+import org.greenrobot.eventbus.Subscribe;
+import org.greenrobot.eventbus.ThreadMode;
+
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
+
+import cz.mroczis.netmonster.core.INetMonster;
+import cz.mroczis.netmonster.core.model.cell.ICell;
+import info.zamojski.soft.towercollector.analytics.IntentSource;
+import info.zamojski.soft.towercollector.broadcast.BatteryStatusBroadcastReceiver;
+import info.zamojski.soft.towercollector.broadcast.ExternalBroadcastSender;
+import info.zamojski.soft.towercollector.broadcast.LocationModeOrProvidersChangedReceiver;
+import info.zamojski.soft.towercollector.collector.CollectorNotificationHelper;
+import info.zamojski.soft.towercollector.collector.MeasurementUpdater;
+import info.zamojski.soft.towercollector.collector.TelephonyTriple;
+import info.zamojski.soft.towercollector.collector.parsers.MeasurementParser;
+import info.zamojski.soft.towercollector.collector.parsers.MeasurementParserFactory;
+import info.zamojski.soft.towercollector.collector.validators.LocationValidator;
+import info.zamojski.soft.towercollector.collector.validators.SystemTimeValidator;
+import info.zamojski.soft.towercollector.dao.MeasurementsDatabase;
+import info.zamojski.soft.towercollector.enums.GpsStatus;
+import info.zamojski.soft.towercollector.enums.KeepScreenOnMode;
+import info.zamojski.soft.towercollector.enums.MeansOfTransport;
+import info.zamojski.soft.towercollector.enums.NetworkGroup;
+import info.zamojski.soft.towercollector.enums.Validity;
+import info.zamojski.soft.towercollector.events.CollectorStateChangedEvent;
+import info.zamojski.soft.towercollector.events.GpsStatusChangedEvent;
+import info.zamojski.soft.towercollector.events.MeasurementProcessedEvent;
+import info.zamojski.soft.towercollector.events.MeasurementSavedEvent;
+import info.zamojski.soft.towercollector.events.SystemTimeChangedEvent;
+import info.zamojski.soft.towercollector.model.AnalyticsStatistics;
+import info.zamojski.soft.towercollector.model.Cell;
+import info.zamojski.soft.towercollector.model.Measurement;
+import info.zamojski.soft.towercollector.model.Statistics;
+import info.zamojski.soft.towercollector.model.Tuple;
+import info.zamojski.soft.towercollector.utils.GpsUtils;
+import info.zamojski.soft.towercollector.utils.MobileUtils;
+import info.zamojski.soft.towercollector.utils.NetworkTypeUtils;
+import info.zamojski.soft.towercollector.utils.PermissionUtils;
+import timber.log.Timber;
+
+public class CollectorService extends Service {
+
+    public static final String SERVICE_FULL_NAME = CollectorService.class.getCanonicalName();
+    public static final String INTENT_KEY_START_INTENT_SOURCE = "start_intent_source";
+    public static final String BROADCAST_INTENT_STOP_SERVICE = SERVICE_FULL_NAME + ".CollectorStop";
+    static final String INTENT_KEY_KEEP_SCREEN_ON_MODE = "CollectorKeepScreenOnMode";
+    public static final int NOTIFICATION_ID = 'C';
+    private static final int GPS_STATUS_CHECK_INTERVAL = 15000;// milliseconds
+    private static final int CELL_UPDATE_INTERVAL = 10000;// milliseconds
+    private static final int WAKE_LOCK_TIMEOUT = 60000;// milliseconds
+    private static final int WAKE_LOCK_ACQUIRE_INTERVAL = 5000;// milliseconds
+
+    private static final Object reacquireWakeLockLock = new Object();
+
+    private IBinder binder = new LocalBinder();
+    private List<TelephonyTriple> telephonyTriples = new ArrayList<>(2);
+    private Tuple<Method, Boolean> getNeighboringCellInfoMethod;
+    private LocationManager locationManager;
+
+    private NotificationManager notificationManager;
+    private CollectorNotificationHelper notificationHelper;
+
+    private Handler gpsStatusHandler;
+    private HandlerThread measurementParserThread;
+    private Handler measurementParserHandler;
+
+    private HandlerThread externalBroadcastSenderThread;
+    private Handler externalBroadcastSenderHandler;
+    private ExternalBroadcastSender externalBroadcastSender;
+
+    private MeasurementUpdater measurementUpdater = new MeasurementUpdater();
+
+    private float lastGpsAccuracy;
+    private LocationValidator locationValidator;
+
+    // prevent from being garbage collected
+    private MeasurementParser measurementParser;
+    private Timer periodicalPhoneStateListener;
+
+    KeepScreenOnMode keepScreenOnMode;
+    private Timer periodicalWakeLockAcquirer;
+
+    private MeansOfTransport transportMode = MeansOfTransport.Fixed;
+
+    private long startTime;
+    private Statistics startStats;
+    private int numberOfCollectedCells;
+    private Map<NetworkGroup, Integer> collectedCellTypes = new HashMap<>();
+
+    private Location lastLocation;
+    private long lastLocationObtainedTime;
+    private GpsStatus gpsStatus = GpsStatus.Initializing;
+    private Validity lastIsSystemTimeValid = Validity.Valid;
+
+    private SystemTimeValidator systemTimeValidator = new SystemTimeValidator();
+
+    private PowerManager powerManager;
+    private WakeLock wakeLock;
+
+    private IntentSource startIntentSource = IntentSource.System;
+    private int apiVersionUsed;
+
+    private boolean isCreatedSuccessfully = false;
+
+    // ========== SERVICE ========== //
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        Timber.d("onCreate(): Creating service");
+
+        notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        boolean hideNotification = MyApplication.getPreferencesProvider().getHideCollectorNotification();
+        notificationHelper = new CollectorNotificationHelper(this, hideNotification);
+
+        // start as foreground service immediately to prevent ForegroundServiceDidNotStartInTimeException
+        Notification notification = notificationHelper.createNotification(notificationManager, getGpsStatusNotificationText(getGpsStatus()));
+        try {
+            if (PermissionUtils.isForegroundServicePermissionAware()) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+            } else {
+                startForeground(NOTIFICATION_ID, notification);
+            }
+            isCreatedSuccessfully = true;
+        } catch (IllegalStateException ex) {
+            Timber.e(ex, "onCreate(): Failed to start foreground service");
+            stopSelf();
+            return;
+        } catch (SecurityException ex) {
+            Timber.e(ex, "onCreate(): Security exception when starting foreground service");
+            stopSelf();
+            return;
+        }
+
+        MyApplication.startBackgroundTask(this);
+        // get managers
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        TelephonyManager defaultTelephonyManager = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+        if (MobileUtils.isApi24MultiSimCompatible()) { // multi-sim, multiple listeners
+            try {
+                SubscriptionManager subscriptionManager = (SubscriptionManager) getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+                List<SubscriptionInfo> activeSubscriptions = subscriptionManager.getActiveSubscriptionInfoList();
+                if (activeSubscriptions == null || activeSubscriptions.isEmpty()) {
+                    // fallback in case subscriptions state is unknown or inactive
+                    Timber.d("onCreate(): Multi SIM - no active subscriptions found - adding default");
+                    telephonyTriples.add(new TelephonyTriple(defaultTelephonyManager));
+                } else {
+                    Timber.d("onCreate(): Multi SIM - %s active subscriptions found", activeSubscriptions.size());
+                    for (SubscriptionInfo subscription : activeSubscriptions) {
+                        TelephonyManager telephonyManager = defaultTelephonyManager.createForSubscriptionId(subscription.getSubscriptionId());
+                        telephonyTriples.add(new TelephonyTriple(telephonyManager));
+                    }
+                    // if due to some stupid bug active subscription don't have telephony manager
+                    if (telephonyTriples.isEmpty()) {
+                        Timber.d("onCreate(): Multi SIM - Active  subscriptions found but not added - adding default");
+                        telephonyTriples.add(new TelephonyTriple(defaultTelephonyManager));
+                    }
+                }
+            } catch (SecurityException ex) {
+                Timber.e(ex, "onCreate(): phone permission is denied");
+                stopSelf();
+                return;
+            }
+        } else { // single-sim, single listener
+            Timber.d("onCreate(): Single SIM - adding default subscription");
+            telephonyTriples.add(new TelephonyTriple(defaultTelephonyManager));
+        }
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                startStats = MeasurementsDatabase.getInstance(MyApplication.getApplication()).getMeasurementsStatistics();
+            }
+        }).start();
+
+        startTime = lastLocationObtainedTime = System.currentTimeMillis();
+        EventBus.getDefault().register(this);
+        // register receiver
+        ContextCompat.registerReceiver(MyApplication.getApplication(), stopRequestBroadcastReceiver, new IntentFilter(BROADCAST_INTENT_STOP_SERVICE), ContextCompat.RECEIVER_NOT_EXPORTED);
+        registerReceiver(batteryStatusBroadcastReceiver, new IntentFilter(Intent.ACTION_BATTERY_LOW));
+        registerReceiver(locationModeOrProvidersChanged, new IntentFilter(LocationManager.MODE_CHANGED_ACTION));
+        registerReceiver(locationModeOrProvidersChanged, new IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION));
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        super.onStartCommand(intent, flags, startId);
+        if (!isCreatedSuccessfully) {
+            Timber.w("onStartCommand(): Service was not created successfully, stopping");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        if (intent == null) {
+            Timber.w("onStartCommand(): Intent is null, stopping");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        Timber.d("onStartCommand(): Starting service with transport mode %s", transportMode);
+        String keepScreenOnModeString = intent.getStringExtra(INTENT_KEY_KEEP_SCREEN_ON_MODE);
+        if (keepScreenOnModeString == null)
+            keepScreenOnModeString = MyApplication.getPreferencesProvider().getCollectorKeepScreenOnMode();
+        if (keepScreenOnModeString.equals(getString(R.string.preferences_keep_screen_on_mode_entries_value_full)))
+            keepScreenOnMode = KeepScreenOnMode.FullBrightness;
+        else if (keepScreenOnModeString.equals(getString(R.string.preferences_keep_screen_on_mode_entries_value_dim)))
+            keepScreenOnMode = KeepScreenOnMode.Dimmed;
+        else
+            keepScreenOnMode = KeepScreenOnMode.Disabled;
+        Timber.d("onStartCommand(): Keep screen on mode: %s", keepScreenOnModeString);
+        startIntentSource = (IntentSource) intent.getSerializableExtra(INTENT_KEY_START_INTENT_SOURCE);
+        if (startIntentSource == null)
+            startIntentSource = IntentSource.System;
+        measurementUpdater.setMinDistanceAndInterval(transportMode.getDistance());
+        locationValidator = new LocationValidator(transportMode.getAccuracy());
+        // listen for RSSI (ASU) and cell change
+        periodicalPhoneStateListener = new Timer();
+        try {
+            registerPhoneStateListener();
+        } catch (SecurityException ex) {
+            Timber.e(ex, "onStartCommand(): coarse location permission is denied");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        // make sure GPS is available on the device otherwise the following lines will throw an exception
+        if (!GpsUtils.isGpsEnabled(this)) {
+            Timber.w("onStartCommand(): GPS is unavailable, stopping");
+            Toast.makeText(this, R.string.collector_gps_unavailable, Toast.LENGTH_LONG).show();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        try {
+            // listen for GPS location change
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,  transportMode.getMinTime(), 0, locationListener);
+            Timber.d("onStartCommand(): Service started with min distance: 0 and min time: %s", transportMode.getMinTime());
+        } catch (SecurityException ex) {
+            Timber.e(ex, "onStartCommand(): fine location permission is denied");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        registerWakeLockAcquirer();
+
+        scheduleNextGpsStatusCheck();
+
+        // send current gps status
+        GpsStatus status = getGpsStatus();
+        float accuracy = getLastGpsAccuracy();
+        EventBus.getDefault().postSticky(new GpsStatusChangedEvent(status, accuracy));
+
+        EventBus.getDefault().postSticky(new CollectorStateChangedEvent(true));
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            CollectorQuickSettingsTileService.requestTileUpdate(true);
+        }
+
+        boolean notifyCollected = MyApplication.getPreferencesProvider().getNotifyMeasurementsCollected();
+        if (notifyCollected) {
+            externalBroadcastSender = new ExternalBroadcastSender();
+            getExternalBroadcastSenderHandler().post(externalBroadcastSender);
+        }
+        MyApplication.getAnalytics().sendPrefsNotifyMeasurementsCollected(notifyCollected);
+
+        return START_REDELIVER_INTENT;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        Timber.d("onBind(): Binding to service");
+        return binder;
+    }
+
+    @Override
+    public void onDestroy() {
+        Timber.d("onDestroy(): Destroying service");
+        if (periodicalWakeLockAcquirer != null) {
+            periodicalWakeLockAcquirer.cancel();
+        }
+        synchronized (reacquireWakeLockLock) {
+            if (wakeLock != null && wakeLock.isHeld())
+                wakeLock.release();
+        }
+        MyApplication.stopBackgroundTask();
+        stopForeground(true);
+        cancelNextGpsStatusCheck();
+        if (periodicalPhoneStateListener != null) {
+            periodicalPhoneStateListener.cancel();
+        }
+        if (measurementParser != null) {
+            measurementParser.stop();
+        }
+        if (externalBroadcastSender != null) {
+            externalBroadcastSender.stop();
+        }
+        EventBus.getDefault().postSticky(new GpsStatusChangedEvent());
+        EventBus.getDefault().postSticky(new CollectorStateChangedEvent(false));
+        if (EventBus.getDefault().isRegistered(this)) {
+            EventBus.getDefault().unregister(this);
+        }
+        unregisterReceiverSafely(stopRequestBroadcastReceiver);
+        unregisterReceiverSafely(batteryStatusBroadcastReceiver);
+        unregisterReceiverSafely(locationModeOrProvidersChanged);
+        long endTime = System.currentTimeMillis();
+        if (notificationManager != null) {
+            notificationManager.cancel(NOTIFICATION_ID);
+        }
+        if (locationManager != null) {
+            if (locationListener != null)
+                locationManager.removeUpdates(locationListener);
+        }
+        for (TelephonyTriple telephonyTriple : telephonyTriples) {
+            TelephonyManager telephonyManager = telephonyTriple.getTelephonyManager();
+            PhoneStateListener phoneStateListener = telephonyTriple.getPhoneStateListener();
+            if (telephonyManager != null && phoneStateListener != null)
+                telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE);
+        }
+        if (measurementParserThread != null)
+            measurementParserThread.quit();
+        if (externalBroadcastSenderThread != null)
+            externalBroadcastSenderThread.quit();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            CollectorQuickSettingsTileService.requestTileUpdate(false);
+        }
+        long duration = (endTime - startTime);
+        if (startStats != null) {
+            Statistics endStats = MeasurementsDatabase.getInstance(MyApplication.getApplication()).getMeasurementsStatistics();
+            int numberOfCollectedLocations = endStats.getLocationsLocal() - startStats.getLocationsLocal();
+            AnalyticsStatistics stats = new AnalyticsStatistics();
+            stats.setLocations(numberOfCollectedLocations);
+            stats.setCells(numberOfCollectedCells);
+            MyApplication.getAnalytics().sendCollectorFinished(startIntentSource, transportMode.name(), apiVersionUsed, duration, stats, collectedCellTypes);
+        }
+        super.onDestroy();
+    }
+
+    // ========== NOTIFICATION ========== //
+
+    private synchronized void updateNotification(Statistics statistics, Measurement measurement) {
+        Notification notification = notificationHelper.updateNotification(statistics, measurement);
+        Timber.d("updateNotification(): Setting statistics: %s", statistics);
+        notificationManager.notify(NOTIFICATION_ID, notification);
+    }
+
+    private synchronized void updateNotification(String notificationText) {
+        Notification notification = notificationHelper.updateNotification(notificationText);
+        Timber.d("updateNotification(): Setting text: %s", notificationText);
+        notificationManager.notify(NOTIFICATION_ID, notification);
+    }
+
+    // ========== LISTENERS ========== //
+
+    private void registerPhoneStateListener() {
+        String collectorApiVersion = MyApplication.getPreferencesProvider().getCollectorApiVersion();
+        if (getString(R.string.preferences_collector_api_version_entries_value_auto).equals(collectorApiVersion)) {
+            // auto detection
+            MyApplication.getAnalytics().sendPrefsCollectorApiVersion(0);
+            if (MobileUtils.isNetMonsterCoreApiCompatible(this)) {
+                registerNetMonsterListener();
+            } else if (MobileUtils.isApi17FullyCompatible(this)) {
+                registerApi17PhoneStateListener();
+            } else {
+                registerApi1PhoneStateListener();
+            }
+        } else if (getString(R.string.preferences_collector_api_version_entries_value_api_netmonster).equals(collectorApiVersion)) {
+            // API NetMonster Core forced
+            MyApplication.getAnalytics().sendPrefsCollectorApiVersion(100);
+            registerNetMonsterListener();
+        } else if (getString(R.string.preferences_collector_api_version_entries_value_api_17).equals(collectorApiVersion)) {
+            // API 17 forced
+            MyApplication.getAnalytics().sendPrefsCollectorApiVersion(17);
+            registerApi17PhoneStateListener();
+        } else {
+            // API 1 forced
+            MyApplication.getAnalytics().sendPrefsCollectorApiVersion(1);
+            registerApi1PhoneStateListener();
+        }
+    }
+
+    private void registerApi17PhoneStateListener() {
+        Timber.d("registerApi17PhoneStateListener(): Registering API 17 phone state listener");
+        boolean collectNeighboringCells = MyApplication.getPreferencesProvider().getCollectNeighboringCells();
+        measurementParser = new MeasurementParserFactory().CreateApi17Parser(transportMode.getAccuracy(), collectNeighboringCells);
+        getMeasurementParserHandler().post(measurementParser);
+        int telephonyManagerIndex = 0;
+        for (TelephonyTriple telephonyTriple : telephonyTriples) {
+            TelephonyManager telephonyManager = telephonyTriple.getTelephonyManager();
+            // callback is registered for all sim cards but it's hard to union 2 data sets reported at different time to process them as one, so calling getAllCellInfo to get at least partially refreshed data in a single call
+            final int finalTelephonyManagerIndex = telephonyManagerIndex;
+            PhoneStateListener phoneStateListener = new PhoneStateListener() {
+                private final String INNER_TAG = CollectorService.class.getSimpleName() + ".Api17Plus" + PhoneStateListener.class.getSimpleName() + "ForIndex" + finalTelephonyManagerIndex;
+
+                @Override
+                public void onCellInfoChanged(List<CellInfo> cellInfo) {
+                    if (cellInfo == null) {
+                        Timber.tag(INNER_TAG).d("onCellInfoChanged(): Null reported");
+                        return;
+                    } else {
+                        Timber.tag(INNER_TAG).d("onCellInfoChanged(): Cell info changed: %s ", cellInfo);
+                    }
+                    try {
+                        List<CellInfo> allCellInfo = telephonyManager.getAllCellInfo();
+                        Timber.tag(INNER_TAG).d("onCellInfoChanged(): Number of cells changed: %s, ignoring result from this subscription only, passing %s cells instead", cellInfo.size(), allCellInfo == null ? "null" : allCellInfo.size());
+                        processCellInfo(allCellInfo);
+                    } catch (SecurityException ex) {
+                        Timber.tag(INNER_TAG).e(ex, "onCellInfoChanged(): Coarse location or phone permission is denied");
+                        stopSelf();
+                    }
+                }
+            };
+            try {
+                telephonyTriple.setPhoneStateListener(phoneStateListener);
+                telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_SIGNAL_STRENGTHS | PhoneStateListener.LISTEN_CELL_INFO);
+            } catch (SecurityException ex) {
+                Timber.e(ex, "registerApi17PhoneStateListener(): Coarse location permission is denied");
+                stopSelf();
+            }
+
+            if (MobileUtils.isApi29Limited()) {
+                // callback is registered for all sim cards but it's hard to union 2 data sets reported at different time to process them as one, so calling getAllCellInfo to get at least partially refreshed data in a single call
+                TelephonyManager.CellInfoCallback cellInfoUpdateRequestCallback = new TelephonyManager.CellInfoCallback() {
+                    private final String INNER_TAG = CollectorService.class.getSimpleName() + "." + TelephonyManager.CellInfoCallback.class.getSimpleName();
+
+                    @Override
+                    public void onCellInfo(@NonNull List<CellInfo> cellInfo) {
+                        if (cellInfo == null) {
+                            Timber.tag(INNER_TAG).d("onCellInfo(): Null reported");
+                            return;
+                        } else {
+                            Timber.tag(INNER_TAG).d("onCellInfo(): Cell info update result: %s ", cellInfo);
+                        }
+                        try {
+                            List<CellInfo> allCellInfo = telephonyManager.getAllCellInfo();
+                            Timber.tag(INNER_TAG).d("onCellInfo(): Number of cells updated: %s, ignoring result from this subscription only, passing %s cells instead", cellInfo.size(), allCellInfo == null ? "null" : allCellInfo.size());
+                            processCellInfo(allCellInfo);
+                        } catch (SecurityException ex) {
+                            Timber.tag(INNER_TAG).e(ex, "onCellInfo(): Coarse location or phone permission is denied");
+                            stopSelf();
+                        }
+                    }
+
+                    @Override
+                    public void onError(int errorCode, Throwable detail) {
+                        Timber.tag(INNER_TAG).e(detail, "onError(): Error %s occurred when requesting cell info update", errorCode);
+                    }
+                };
+                telephonyTriple.setCellInfoUpdateRequestCallback(cellInfoUpdateRequestCallback);
+            }
+            telephonyManagerIndex++;
+        }
+
+        // run scheduled cell listener
+        periodicalPhoneStateListener.schedule(new TimerTask() {
+            private final String INNER_TAG = CollectorService.class.getSimpleName() + ".Periodical" + PhoneStateListener.class.getSimpleName();
+
+            @Override
+            public void run() {
+                try {
+                    List<CellInfo> cellInfo;
+                    if (MobileUtils.isApi29Limited()) {
+                        for (TelephonyTriple telephonyTriple : telephonyTriples) {
+                            TelephonyManager telephonyManager = telephonyTriple.getTelephonyManager();
+                            TelephonyManager.CellInfoCallback cellInfoUpdateRequestCallback = (TelephonyManager.CellInfoCallback) telephonyTriple.getCellInfoUpdateRequestCallback();
+                            // value is cached and update needs to be requested
+                            try {
+                                telephonyManager.requestCellInfoUpdate(getMainExecutor(), cellInfoUpdateRequestCallback);
+                            } catch (Exception ex) {
+                                Timber.tag(INNER_TAG).e(ex, "run(): Exception requesting cell info update");
+                            }
+                        }
+                    } else {
+                        // value should be refreshed on the call
+                        cellInfo = telephonyTriples.get(0).getTelephonyManager().getAllCellInfo();
+                        if (cellInfo == null) {
+                            Timber.tag(INNER_TAG).d("run(): Null reported");
+                            return;
+                        }
+                        Timber.tag(INNER_TAG).d("run(): Number of cells: %s", cellInfo.size());
+                        processCellInfo(cellInfo);
+                    }
+                } catch (SecurityException ex) {
+                    Timber.tag(INNER_TAG).e(ex, "run(): coarse location or phone permission is denied");
+                    stopSelf();
+                } catch (Exception ex) {
+                    Timber.tag(INNER_TAG).e(ex, "run(): Exception updating cell info");
+                }
+            }
+        }, 0, CELL_UPDATE_INTERVAL);
+        apiVersionUsed = 17;
+    }
+
+    private void registerApi1PhoneStateListener() {
+        Timber.d("registerApi1PhoneStateListener(): Registering API 1 phone state listener");
+        boolean collectNeighboringCells = MyApplication.getPreferencesProvider().getCollectNeighboringCells();
+        measurementParser = new MeasurementParserFactory().CreateApi1Parser(transportMode.getAccuracy(), collectNeighboringCells);
+        getMeasurementParserHandler().post(measurementParser);
+        TelephonyTriple telephonyTriple = telephonyTriples.get(0);
+        TelephonyManager telephonyManager = telephonyTriple.getTelephonyManager();
+        PhoneStateListener phoneStateListener = new PhoneStateListener() {
+            private final String INNER_TAG = CollectorService.class.getSimpleName() + ".Legacy" + PhoneStateListener.class.getSimpleName();
+
+            @Override
+            public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+                // in GSM networks, ASU is equal to the RSSI (received signal strength indicator, see TS 27.007)
+                measurementUpdater.setLastSignalStrength(signalStrength);
+                Timber.tag(INNER_TAG).d("onSignalStrengthsChanged(): Signal strength = %s", signalStrength);
+            }
+
+            @Override
+            public void onCellLocationChanged(CellLocation cellLocation) {
+                try {
+                    Timber.tag(INNER_TAG).d("onCellLocationChanged(): %s", cellLocation);
+                    List<NeighboringCellInfo> neighboringCells = null;
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        neighboringCells = getNeighboringCellInfo(telephonyManager);
+                    }
+                    processCellLocation(telephonyManager, cellLocation, neighboringCells);
+                } catch (SecurityException ex) {
+                    Timber.tag(INNER_TAG).e(ex, "onCellLocationChanged(): coarse location or phone permission is denied");
+                    stopSelf();
+                } catch (Exception ex) {
+                    Timber.tag(INNER_TAG).e(ex, "onCellLocationChanged(): Exception processing cell location");
+                }
+            }
+        };
+        try {
+            telephonyTriple.setPhoneStateListener(phoneStateListener);
+            telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_SIGNAL_STRENGTHS | PhoneStateListener.LISTEN_CELL_LOCATION);
+        } catch (SecurityException ex) {
+            Timber.e(ex, "registerApi1PhoneStateListener(): coarse location permission is denied");
+            stopSelf();
+        }
+        // run scheduled cell listener
+        periodicalPhoneStateListener.schedule(new TimerTask() {
+            private final String INNER_TAG = CollectorService.class.getSimpleName() + ".Periodical" + PhoneStateListener.class.getSimpleName();
+
+            @Override
+            public void run() {
+                try {
+                    CellLocation cellLocation = telephonyManager.getCellLocation();
+                    Timber.tag(INNER_TAG).d("run(): %s", cellLocation);
+                    List<NeighboringCellInfo> neighboringCells = null;
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        neighboringCells = getNeighboringCellInfo(telephonyManager);
+                    }
+                    processCellLocation(telephonyManager, cellLocation, neighboringCells);
+                } catch (SecurityException ex) {
+                    Timber.tag(INNER_TAG).e(ex, "run(): coarse location or phone permission is denied");
+                    stopSelf();
+                } catch (Exception ex) {
+                    Timber.tag(INNER_TAG).e(ex, "run(): failed to retrieve cell identifiers");
+                }
+            }
+        }, 0, CELL_UPDATE_INTERVAL);
+        apiVersionUsed = 1;
+    }
+
+    private void registerNetMonsterListener() {
+        Timber.d("registerNetMonsterListener(): Registering NetMonster Core listener");
+        INetMonster netMonster = null;
+        try {
+            netMonster = MobileUtils.getNetMonsterCore(this);
+        } catch (Exception ex) {
+            Timber.e(ex, "registerNetMonsterListener(): Exception initializing NetMonster Core");
+        }
+        if (netMonster == null) {
+            Timber.w("registerNetMonsterListener(): NetMonster Core unavailable, falling back to API 17");
+            registerApi17PhoneStateListener();
+            return;
+        }
+        boolean collectNeighboringCells = MyApplication.getPreferencesProvider().getCollectNeighboringCells();
+        measurementParser = new MeasurementParserFactory().CreateNetMonsterParser(transportMode.getAccuracy(), collectNeighboringCells);
+        getMeasurementParserHandler().post(measurementParser);
+
+        final INetMonster finalNetMonster = netMonster;
+        // run scheduled cell listener
+        periodicalPhoneStateListener.schedule(new TimerTask() {
+            private final String INNER_TAG = CollectorService.class.getSimpleName() + ".Periodical" + PhoneStateListener.class.getSimpleName();
+
+            @Override
+            public void run() {
+                try {
+                    List<ICell> cells = finalNetMonster.getCells();
+                    if (cells == null) {
+                        Timber.tag(INNER_TAG).d("run(): Null reported");
+                        return;
+                    }
+                    Timber.tag(INNER_TAG).d("run(): Number of cells: %s", cells.size());
+                    processNetMonsterCell(cells);
+                } catch (SecurityException ex) {
+                    Timber.tag(INNER_TAG).e(ex, "run(): coarse location or phone permission is denied");
+                    stopSelf();
+                } catch (Exception ex) {
+                    Timber.tag(INNER_TAG).e(ex, "run(): Exception fetching cells from NetMonster Core");
+                }
+            }
+        }, 0, CELL_UPDATE_INTERVAL);
+        apiVersionUsed = 100;
+    }
+
+    private void processCellInfo(List<CellInfo> cellInfo) {
+        measurementUpdater.setLastCellInfo(cellInfo);
+    }
+
+    private void processNetMonsterCell(List<ICell> cells) {
+        measurementUpdater.setLastNetMonsterCell(cells);
+    }
+
+    @SuppressWarnings("MissingPermission") // because it's requested before running the service and wrapped in try-catch on calling site, not reported as compilation error target on API <= 36
+    private void processCellLocation(TelephonyManager telephonyManager, CellLocation
+            cellLocation, List<NeighboringCellInfo> neighboringCells) {
+        // get network type
+        int networkTypeInt = telephonyManager.getNetworkType();
+        NetworkGroup networkType = NetworkTypeUtils.getNetworkGroup(networkTypeInt);
+        // get network operator (may be unreliable for CDMA)
+        String networkOperatorCode = telephonyManager.getNetworkOperator();
+        String networkOperatorName = telephonyManager.getNetworkOperatorName();
+        Timber.d("processCellLocation(): Operator code = '%s', name = '%s'", networkOperatorCode, networkOperatorName);
+        Timber.d("processCellLocation(): Reported %s neighboring cells", (neighboringCells != null ? neighboringCells.size() : null));
+        measurementUpdater.setLastCellLocation(cellLocation, networkType, networkOperatorCode, networkOperatorName, neighboringCells);
+    }
+
+    private LocationListener locationListener = new LocationListener() {
+        private final String INNER_TAG = CollectorService.class.getSimpleName() + "." + LocationListener.class.getSimpleName();
+
+        @Override
+        public void onStatusChanged(String provider, int status, Bundle extras) {
+            // on Android 10 this callback will never be invoked
+            String statusString;
+            switch (status) {
+                case LocationProvider.AVAILABLE:
+                    statusString = "AVAILABLE";
+                    break;
+                case LocationProvider.OUT_OF_SERVICE:
+                    statusString = "OUT_OF_SERVICE";
+                    break;
+                case LocationProvider.TEMPORARILY_UNAVAILABLE:
+                    statusString = "TEMPORARILY_UNAVAILABLE";
+                    break;
+                default:
+                    statusString = "UNKNOWN";
+                    break;
+            }
+            Timber.tag(INNER_TAG).d("onStatusChanged(): %s", statusString);
+        }
+
+        @Override
+        public void onProviderEnabled(String provider) {
+            Timber.tag(INNER_TAG).d("onProviderEnabled(): %s", provider);
+        }
+
+        @Override
+        public void onProviderDisabled(String provider) {
+            Timber.tag(INNER_TAG).d("onProviderDisabled(): %s", provider);
+        }
+
+        @Override
+        public void onLocationChanged(Location location) {
+            Timber.tag(INNER_TAG).d("onLocationChanged(): %s", location);
+            lastLocation = location;
+            long locationObtainedTime = System.currentTimeMillis();
+            lastLocationObtainedTime = locationObtainedTime;
+            setLastGpsAccuracy(location);
+            measurementUpdater.setLastLocation(location, locationObtainedTime);
+            updateGpsStatus(lastLocation, lastLocationObtainedTime, System.currentTimeMillis());
+        }
+    };
+
+    // ========== EVENTS ========== //
+
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onEvent(MeasurementProcessedEvent event) {
+        float speed = 0;
+        if (event instanceof MeasurementSavedEvent) {
+            MeasurementSavedEvent savedEvent = (MeasurementSavedEvent) event;
+            Measurement measurement = savedEvent.getMeasurement();
+            speed = measurement.getGpsSpeed();
+            updateNotification(savedEvent.getStatistics(), measurement);
+            // update analytics statistics
+            for (Cell cell : measurement.getMainCells()) {
+                NetworkGroup networkType = cell.getNetworkType();
+                Integer count = collectedCellTypes.get(networkType);
+                collectedCellTypes.put(networkType, count == null ? 1 : count + 1);
+            }
+            numberOfCollectedCells += measurement.getCells().size();
+        }
+    }
+
+    // ========== BROADCAST RECEIVERS ========== //
+
+    private BroadcastReceiver stopRequestBroadcastReceiver = new BroadcastReceiver() {
+        private final String INNER_TAG = CollectorService.class.getSimpleName() + ".StopRequest" + BroadcastReceiver.class.getSimpleName();
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            Timber.tag(INNER_TAG).d("stopRequestBroadcastReceiver.onReceive(): Received broadcast intent: %s", intent);
+            if (intent.getAction().equals(BROADCAST_INTENT_STOP_SERVICE)) {
+                stopSelf();
+            }
+        }
+    };
+
+    private BroadcastReceiver batteryStatusBroadcastReceiver = new BatteryStatusBroadcastReceiver();
+
+    private BroadcastReceiver locationModeOrProvidersChanged = new LocationModeOrProvidersChangedReceiver(this);
+
+    // ========== MISCELLANEOUS ========== //
+
+    private Handler getGpsStatusHandler() {
+        if (gpsStatusHandler == null) {
+            gpsStatusHandler = new Handler();
+        }
+        return gpsStatusHandler;
+    }
+
+    private Handler getMeasurementParserHandler() {
+        if (measurementParserHandler == null) {
+            measurementParserThread = new HandlerThread("MeasurementParserHandler");
+            measurementParserThread.start();
+            measurementParserHandler = new Handler(measurementParserThread.getLooper());
+        }
+        return measurementParserHandler;
+    }
+
+    private Handler getExternalBroadcastSenderHandler() {
+        if (externalBroadcastSenderHandler == null) {
+            externalBroadcastSenderThread = new HandlerThread("ExternalBroadcastSenderHandler");
+            externalBroadcastSenderThread.start();
+            externalBroadcastSenderHandler = new Handler(externalBroadcastSenderThread.getLooper());
+        }
+        return externalBroadcastSenderHandler;
+    }
+
+    private class LocalBinder extends Binder implements ICollectorService {
+        @Override
+        public GpsStatus getGpsStatus() {
+            return CollectorService.this.getGpsStatus();
+        }
+
+        @Override
+        public float getGpsLastAccuracy() {
+            return CollectorService.this.getLastGpsAccuracy();
+        }
+
+        @Override
+        public Validity isSystemTimeValid() {
+            return CollectorService.this.getLastIsSystemTimeValid();
+        }
+    }
+
+    private void updateGpsStatus(Location location, long gpsTimestamp, long systemTimestamp) {
+        GpsStatus status;
+        if (location == null) {
+            status = GpsStatus.Initializing;
+        } else if (!locationValidator.isUpToDate(gpsTimestamp, systemTimestamp)) {
+            status = GpsStatus.NoLocation;
+        } else if (!locationValidator.hasRequiredAccuracy(location)) {
+            status = GpsStatus.LowAccuracy;
+        } else {
+            status = GpsStatus.Ok;
+        }
+        Timber.d("updateGpsStatus(): Updating gps status = %s", status);
+        setGpsStatus(status);
+    }
+
+    private void updateSystemTimeChange(Location location) {
+        if (location == null) {
+            Timber.w("updateSystemTimeChange(): Location is null");
+            return;
+        }
+        boolean valid = systemTimeValidator.isValid(System.currentTimeMillis(), location.getTime());
+        if (valid) {
+            if (lastIsSystemTimeValid != Validity.Valid) {
+                Timber.d("updateSystemTimeChange(): Setting system time to valid");
+                EventBus.getDefault().postSticky(new SystemTimeChangedEvent(Validity.Valid));
+                lastIsSystemTimeValid = Validity.Valid;
+            }
+        } else {
+            if (lastIsSystemTimeValid != Validity.Invalid) {
+                Timber.d("updateSystemTimeChange(): Setting system time to invalid");
+                EventBus.getDefault().postSticky(new SystemTimeChangedEvent(Validity.Invalid));
+                lastIsSystemTimeValid = Validity.Invalid;
+            }
+        }
+    }
+
+    private Runnable gpsStatusCheck = new Runnable() {
+        private final String INNER_TAG = CollectorService.class.getSimpleName() + ".GpsStatusCheckRunnable";
+
+        @Override
+        public void run() {
+            Timber.tag(INNER_TAG).d("run(): GPS status check performed");
+            updateGpsStatus(lastLocation, lastLocationObtainedTime, System.currentTimeMillis());
+            scheduleNextGpsStatusCheck();
+        }
+    };
+
+    private void scheduleNextGpsStatusCheck() {
+        Timber.d("scheduleNextGpsStatusCheck(): Setting next GPS status check");
+        getGpsStatusHandler().postDelayed(gpsStatusCheck, GPS_STATUS_CHECK_INTERVAL);
+    }
+
+    private void cancelNextGpsStatusCheck() {
+        Timber.d("cancelNextGpsStatusCheck(): Cancelling GPS status check");
+        getGpsStatusHandler().removeCallbacks(gpsStatusCheck);
+    }
+
+    private void registerWakeLockAcquirer() {
+        if (keepScreenOnMode == KeepScreenOnMode.Disabled) {
+            Timber.d("registerWakeLockAcquirer(): WakeLock not configured");
+            return;
+        }
+        periodicalWakeLockAcquirer = new Timer();
+        // run scheduled cell listener
+        periodicalWakeLockAcquirer.schedule(new TimerTask() {
+            private final String INNER_TAG = CollectorService.class.getSimpleName() + ".Periodical" + WakeLock.class.getSimpleName() + "Acquirer";
+
+            @Override
+            public void run() {
+                synchronized (reacquireWakeLockLock) {
+                    WakeLock oldWakeLock = wakeLock;
+                    Timber.tag(INNER_TAG).d("run(): New WakeLock acquire");
+                    wakeLock = createWakeLock(keepScreenOnMode);
+                    wakeLock.acquire(WAKE_LOCK_TIMEOUT);
+                    Timber.tag(INNER_TAG).d("run(): Old WakeLock release");
+                    if (oldWakeLock != null && oldWakeLock.isHeld())
+                        oldWakeLock.release();
+                }
+            }
+        }, 0, WAKE_LOCK_ACQUIRE_INTERVAL);
+    }
+
+    private WakeLock createWakeLock(KeepScreenOnMode keepScreenOnMode) {
+        WakeLock newWakeLock = null;
+        if (keepScreenOnMode == KeepScreenOnMode.FullBrightness) {
+            newWakeLock = powerManager.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE, SERVICE_FULL_NAME + ".BrightWakeLock_" + System.currentTimeMillis());
+            newWakeLock.setReferenceCounted(false);
+        } else if (keepScreenOnMode == KeepScreenOnMode.Dimmed) {
+            newWakeLock = powerManager.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE, SERVICE_FULL_NAME + ".DimWakeLock_" + System.currentTimeMillis());
+            newWakeLock.setReferenceCounted(false);
+        }
+        return newWakeLock;
+    }
+
+    private List<NeighboringCellInfo> getNeighboringCellInfo(TelephonyManager telephonyManager) {
+        try {
+            if (getNeighboringCellInfoMethod == null) {
+                getNeighboringCellInfoMethod = new Tuple<>(TelephonyManager.class.getMethod("getNeighboringCellInfo"), Boolean.TRUE);
+            }
+            if (getNeighboringCellInfoMethod.getItem2() == Boolean.TRUE) {
+                return (List<NeighboringCellInfo>) getNeighboringCellInfoMethod.getItem1().invoke(telephonyManager);
+            }
+        } catch (NoSuchMethodException ex) {
+            getNeighboringCellInfoMethod = new Tuple<>(null, Boolean.FALSE);
+            Timber.w(ex, "getNeighboringCellInfo(): Method not found");
+        } catch (Exception ex) {
+            Timber.w(ex, "getNeighboringCellInfo(): Cannot get neighboring cell info");
+        }
+        return null;
+    }
+
+    private GpsStatus getGpsStatus() {
+        return this.gpsStatus;
+    }
+
+    public void setGpsStatus(GpsStatus status) {
+        Timber.d("setGpsStatus(): Setting gps status = %s", status);
+        boolean statusChanged = (this.gpsStatus != status);
+        this.gpsStatus = status;
+        float accuracy = getLastGpsAccuracy();
+        // Update always because accuracy might change
+        EventBus.getDefault().postSticky(new GpsStatusChangedEvent(status, accuracy));
+        if (gpsStatus != GpsStatus.Ok) {
+            String notificationText = getGpsStatusNotificationText(gpsStatus);
+            updateNotification(notificationText);
+        }
+        // Optimization: it doesn't make sense to refresh if nothing changes (after save updated in a different way)
+        else if (statusChanged) {
+            updateNotification(MeasurementsDatabase.getInstance(MyApplication.getApplication()).getMeasurementsStatistics(), MeasurementsDatabase.getInstance(MyApplication.getApplication()).getLastMeasurement());
+        }
+    }
+
+    private String getGpsStatusNotificationText(GpsStatus status) {
+        String statusString;
+        switch (status) {
+            case LowAccuracy:
+                // length unit
+                boolean useImperialUnits = MyApplication.getPreferencesProvider().getUseImperialUnits();
+                String lengthUnit;
+                if (useImperialUnits) {
+                    lengthUnit = getString(R.string.unit_length_imperial);
+                } else {
+                    lengthUnit = getString(R.string.unit_length_metric);
+                }
+                // format string
+                float accuracy = getLastGpsAccuracy();
+                statusString = getString(R.string.status_low_gps_accuracy, accuracy, lengthUnit);
+                break;
+            case NoLocation:
+                statusString = getString(R.string.status_no_gps_location);
+                break;
+            case Disabled:
+                statusString = getString(R.string.status_disabled);
+                break;
+            case Initializing:
+                statusString = getString(R.string.status_initializing);
+                break;
+            default:
+                statusString = status.toString();
+                break;
+        }
+        return getString(R.string.collector_notification_status, statusString);
+    }
+
+    private void unregisterReceiverSafely(BroadcastReceiver broadcastReceiver) {
+        if (broadcastReceiver != null) {
+            try {
+                unregisterReceiver(broadcastReceiver);
+            } catch (IllegalArgumentException ex) {
+                Timber.d(ex);
+            }
+            try {
+                MyApplication.getApplication().unregisterReceiver(broadcastReceiver);
+            } catch (IllegalArgumentException ex) {
+                Timber.d(ex);
+            }
+        }
+    }
+
+    public float getLastGpsAccuracy() {
+        return this.lastGpsAccuracy;
+    }
+
+    public void setLastGpsAccuracy(Location location) {
+        if (location == null) {
+            Timber.w("setLastGpsAccuracy(): Location is null");
+            return;
+        }
+        Timber.d("setLastGpsAccuracy(): Setting last gps accuracy = %s", location.getAccuracy());
+        this.lastGpsAccuracy = (location.hasAccuracy() ? location.getAccuracy() : 1000);
+    }
+
+    public Validity getLastIsSystemTimeValid() {
+        return this.lastIsSystemTimeValid;
+    }
+}
