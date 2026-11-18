@@ -25,6 +25,8 @@ data class BinObservation(
     val dbm: Double,
     /** One-way distance implied by the bin's median timing advance, if any. */
     val taDistanceM: Double? = null,
+    /** 1 for a bin of reported cell ids; the mean resolver confidence otherwise. */
+    val weight: Double = 1.0,
 )
 
 data class EstimatorConfig(
@@ -124,6 +126,7 @@ class TowerEstimator(private val config: EstimatorConfig = EstimatorConfig()) {
                 p = proj.toLocal(b.meanLat, b.meanLon),
                 dbm = b.meanDbm,
                 taDistanceM = b.taMedian?.let { TimingAdvance.distanceM(b.cell.radio, it) },
+                weight = b.weight,
             )
         }
         return estimate(obs, proj)
@@ -210,7 +213,8 @@ class TowerEstimator(private val config: EstimatorConfig = EstimatorConfig()) {
         private val bearing = DoubleArray(obs.size)
         private val sumU = DoubleArray(k)
         private val sumY = DoubleArray(k)
-        private val cnt = IntArray(k)
+        private val cnt = DoubleArray(k)
+        private val w = DoubleArray(obs.size) { obs[it].weight }
         private val az = DoubleArray(k)
         private val azSsr = DoubleArray(AZ_STEPS)
 
@@ -220,7 +224,7 @@ class TowerEstimator(private val config: EstimatorConfig = EstimatorConfig()) {
 
         private fun solve(x: Double, yy: Double, full: Boolean): Solved {
             val m = obs.size
-            sumU.fill(0.0); sumY.fill(0.0); cnt.fill(0)
+            sumU.fill(0.0); sumY.fill(0.0); cnt.fill(0.0)
             for (i in 0 until m) {
                 val dx = obs[i].p.x - x
                 val dy = obs[i].p.y - yy
@@ -231,32 +235,34 @@ class TowerEstimator(private val config: EstimatorConfig = EstimatorConfig()) {
             if (config.useSectorPattern) fitAzimuths(m)
             for (i in 0 until m) {
                 y[i] = obs[i].dbm + gain(i, az[sec[i]])
-                sumU[grp[i]] += u[i]
-                sumY[grp[i]] += y[i]
-                cnt[grp[i]]++
+                sumU[grp[i]] += w[i] * u[i]
+                sumY[grp[i]] += w[i] * y[i]
+                cnt[grp[i]] += w[i]
             }
             var sxy = 0.0
             var sxx = 0.0
             for (i in 0 until m) {
                 val s = grp[i]
                 val du = u[i] - sumU[s] / cnt[s]
-                sxy += du * (y[i] - sumY[s] / cnt[s])
-                sxx += du * du
+                sxy += w[i] * du * (y[i] - sumY[s] / cnt[s])
+                sxx += w[i] * du * du
             }
             val raw = if (sxx > 0) sxy / sxx else config.minExponent
             val n = raw.coerceIn(config.minExponent, config.maxExponent)
             var score = 0.0
             var ss = 0.0
+            var wsum = 0.0
             for (i in 0 until m) {
                 val s = grp[i]
                 val p = sumY[s] / cnt[s] - n * sumU[s] / cnt[s]
                 val r = y[i] - p - n * u[i]
-                ss += r * r
-                score += huber(r / config.sigmaDb)
+                ss += w[i] * r * r
+                wsum += w[i]
+                score += w[i] * huber(r / config.sigmaDb)
                 val ta = obs[i].taDistanceM
                 if (ta != null) {
                     val z = (d[i] - ta) / config.taSigmaM
-                    score += z * z
+                    score += w[i] * z * z
                 }
             }
             if (!full) return Solved(n, false, emptyMap(), emptyMap(), score, 0.0)
@@ -271,7 +277,7 @@ class TowerEstimator(private val config: EstimatorConfig = EstimatorConfig()) {
                     s to Geo.toDegrees(az[j]).let { if (it < 0) it + 360 else it }
                 },
                 score = score,
-                rms = sqrt(ss / m),
+                rms = sqrt(ss / wsum),
             )
         }
 
@@ -302,13 +308,13 @@ class TowerEstimator(private val config: EstimatorConfig = EstimatorConfig()) {
                     val azRad = 2 * Math.PI * a / AZ_STEPS
                     var sum = 0.0
                     var sum2 = 0.0
-                    var c = 0
+                    var c = 0.0
                     for (i in 0 until m) {
                         if (sec[i] != j) continue
                         val v = obs[i].dbm + gain(i, azRad) - n0 * u[i]
-                        sum += v
-                        sum2 += v * v
-                        c++
+                        sum += w[i] * v
+                        sum2 += w[i] * v * v
+                        c += w[i]
                     }
                     azSsr[a] = sum2 - sum * sum / c
                     if (azSsr[a] < azSsr[bestA]) bestA = a

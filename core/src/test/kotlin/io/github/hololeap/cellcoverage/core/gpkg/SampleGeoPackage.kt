@@ -48,7 +48,7 @@ class SampleGeoPackage {
                 p.executeBatch()
             }
             db.prepareStatement(
-                "INSERT INTO cell_bins (geom, cell, site, bx, by, n, mean_dbm, ta_n, ta_median, ta_hist, first_t, last_t) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cell_bins (geom, cell, site, bx, by, n, mean_dbm, ta_n, ta_median, ta_hist, first_t, last_t, w_sum) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             ).use { p ->
                 for (b in bins.all) {
                     p.setBytes(1, GpkgGeometry.encodePoint(b.meanLat, b.meanLon))
@@ -56,7 +56,7 @@ class SampleGeoPackage {
                     p.setInt(4, b.bx); p.setInt(5, b.by); p.setInt(6, b.n); p.setDouble(7, b.meanDbm)
                     p.setInt(8, b.taCount)
                     if (b.taMedian != null) p.setInt(9, b.taMedian!!) else p.setNull(9, java.sql.Types.INTEGER)
-                    p.setString(10, b.taHistogram()); p.setLong(11, b.firstT); p.setLong(12, b.lastT)
+                    p.setString(10, b.taHistogram()); p.setLong(11, b.firstT); p.setLong(12, b.lastT); p.setDouble(13, b.weightSum)
                     p.addBatch()
                 }
                 p.executeBatch()

@@ -7,6 +7,8 @@ import io.github.hololeap.cellcoverage.core.geo.LatLon
 import io.github.hololeap.cellcoverage.core.geo.LocalProjection
 import io.github.hololeap.cellcoverage.core.geo.PointM
 import io.github.hololeap.cellcoverage.core.model.CellKey
+import io.github.hololeap.cellcoverage.core.model.NeighbourReading
+import io.github.hololeap.cellcoverage.core.model.PhysicalId
 import io.github.hololeap.cellcoverage.core.model.RadioType
 import io.github.hololeap.cellcoverage.core.model.Sample
 import kotlin.math.PI
@@ -39,13 +41,20 @@ class SyntheticSite(
     val floorDbm: Double = -125.0,
     /** Report neighbor sectors at all (real phones often give neighbors no cell id). */
     val neighbors: Boolean = true,
+    val pciGroup: Int = 41,
+    /** A second site's eNB id, to build several sites with shared physical ids. */
+    val enbId: Long = 22183L,
 ) {
     val origin = LatLon(47.0, 11.0)
     val proj = LocalProjection(origin)
-    val enb = 22183L
+    val enb = enbId
     val truth: LatLon get() = proj.toLatLon(site.x, site.y)
 
     fun cellOf(sector: Int) = CellKey(RadioType.LTE, 232, 1, 4711, (enb shl 8) + sector + 1)
+
+    /** Physical ids follow the common plan: one PCI group (PCI div 3) per site. */
+    fun pciOf(sector: Int) = 3 * pciGroup + sector
+    fun physicalOf(sector: Int) = PhysicalId(RadioType.LTE, 232, 1, CHANNEL, pciOf(sector))
 
     private fun pattern(bearing: Double, az: Double): Double {
         val r = Geo.angleDiffDeg(bearing, az) / 65.0
@@ -91,6 +100,8 @@ class SyntheticSite(
                     accuracyM = 5f,
                     cell = cellOf(k),
                     registered = k == serving,
+                    pci = pciOf(k),
+                    channel = CHANNEL,
                     dbm = round(levels[k]).toInt(),
                     timingAdvance = ta,
                 )
@@ -100,9 +111,24 @@ class SyntheticSite(
         return out
     }
 
+    /**
+     * Like [drive], but the way many phones report: the serving cell in full and
+     * every neighbour by physical id only.
+     */
+    fun driveWithAnonymousNeighbours(route: List<PointM>, stepM: Double = 30.0): Pair<List<Sample>, List<NeighbourReading>> {
+        val all = drive(route, stepM)
+        val serving = all.filter { it.registered }
+        val anon = all.filter { !it.registered }.map { s ->
+            NeighbourReading(s.timeMs, s.lat, s.lon, s.accuracyM, physicalOf((s.cell.cid and 0xFF).toInt() - 1), s.dbm)
+        }
+        return serving to anon
+    }
+
     fun bins(samples: List<Sample>): CellBins = CellBins().also { b -> samples.forEach { b.add(it) } }
 
     companion object {
+        const val CHANNEL = 6300
+
         fun gauss(r: Random): Double {
             // Box-Muller.
             val u = 1.0 - r.nextDouble()

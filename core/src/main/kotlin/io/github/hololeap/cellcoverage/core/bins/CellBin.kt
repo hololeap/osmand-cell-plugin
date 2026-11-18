@@ -3,6 +3,7 @@ package io.github.hololeap.cellcoverage.core.bins
 
 import io.github.hololeap.cellcoverage.core.geo.Tiles
 import io.github.hololeap.cellcoverage.core.model.CellKey
+import io.github.hololeap.cellcoverage.core.model.IdSource
 import io.github.hololeap.cellcoverage.core.model.Sample
 
 /**
@@ -26,6 +27,16 @@ class CellBin(
         private set
     var meanLat: Double = 0.0
         private set
+
+    /**
+     * Sum of the samples' id confidences: equal to [n] when every cell id was
+     * reported by the phone, less when some were matched by the neighbour resolver.
+     */
+    var weightSum: Double = 0.0
+        private set
+
+    /** The bin's weight in the estimator: the mean id confidence of its samples. */
+    val weight: Double get() = if (n == 0) 0.0 else weightSum / n
     var meanLon: Double = 0.0
         private set
     var firstT: Long = Long.MAX_VALUE
@@ -52,6 +63,7 @@ class CellBin(
     fun add(s: Sample) {
         val dbm = s.dbm ?: return
         n++
+        weightSum += s.idConfidence
         meanDbm += (dbm - meanDbm) / n
         meanLat += (s.lat - meanLat) / n
         meanLon += (s.lon - meanLon) / n
@@ -73,8 +85,10 @@ class CellBin(
         fun restore(
             cell: CellKey, bx: Int, by: Int, n: Int, meanDbm: Double,
             meanLat: Double, meanLon: Double, firstT: Long, lastT: Long, taHistogram: String?,
+            weightSum: Double = n.toDouble(),
         ): CellBin = CellBin(cell, bx, by).also { b ->
             b.n = n
+            b.weightSum = weightSum
             b.meanDbm = meanDbm
             b.meanLat = meanLat
             b.meanLon = meanLon
@@ -90,8 +104,14 @@ class CellBin(
     }
 }
 
-/** An in-memory set of bins, keyed by cell and tile. */
-class CellBins {
+/**
+ * An in-memory set of bins, keyed by cell and tile.
+ *
+ * Samples whose cell id was only guessed (AMBIGUOUS) are left out unless
+ * [includeAmbiguous] is set; RESOLVED samples go in with their confidence as
+ * weight. UNRESOLVED readings never reach here, since they have no cell.
+ */
+class CellBins(private val includeAmbiguous: Boolean = false) {
     private val bins = LinkedHashMap<Triple<CellKey, Int, Int>, CellBin>()
 
     val size: Int get() = bins.size
@@ -100,6 +120,8 @@ class CellBins {
     /** Adds a sample; returns the bin it landed in, or null if it had no signal. */
     fun add(s: Sample): CellBin? {
         if (s.dbm == null) return null
+        if (s.idSource == IdSource.UNRESOLVED) return null
+        if (s.idSource == IdSource.AMBIGUOUS && !includeAmbiguous) return null
         val key = CellBin.keyOf(s)
         val bin = bins.getOrPut(key) { CellBin(key.first, key.second, key.third) }
         bin.add(s)

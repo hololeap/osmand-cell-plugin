@@ -58,11 +58,10 @@ Run the full table (about 8 minutes) with
 
     ESTIMATOR_COMPARE=1 ./gradlew :core:test --tests '*compareModels*' -i
 
-## The open question: neighbours
+## Neighbours
 
-The good numbers above assume the phone reports the other sectors of the site
-as neighbours, with their cell ids. Android often gives a neighbour only its
-PCI and channel, not its cell id. With serving cells only, errors on the hard
-cases rise to 2 to 5 km. A likely fix for M2: remember which cell id each
-(channel, PCI) pair belonged to when it was the serving cell nearby, and
-attribute neighbour readings through that. It is not built yet.
+The good numbers above assume the phone names the site's other sectors as
+neighbours. Most phones give neighbours only a PCI and a channel. Since M2,
+those readings are matched to cell ids by the neighbour resolver, and the
+estimator weights each bin by the match confidence; see
+[neighbour-resolution.md](neighbour-resolution.md).

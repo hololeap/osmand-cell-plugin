@@ -37,6 +37,31 @@ data class ServiceInfo(
 )
 
 /**
+ * A neighbour reported without a cell id: everything a [Sample] holds except the
+ * cell, which the resolver may fill in later. Stored in the `samples` table with
+ * `id_source` UNRESOLVED (or a resolution) and the physical id columns.
+ */
+data class NeighbourReading(
+    val timeMs: Long,
+    val lat: Double,
+    val lon: Double,
+    val accuracyM: Float? = null,
+    val physical: PhysicalId,
+    val dbm: Int? = null,
+    val rsrq: Int? = null,
+    val sinr: Int? = null,
+    val subscriptionId: Int? = null,
+) {
+    /** The sample this reading becomes once [cell] is known. */
+    fun toSample(cell: CellKey, r: Resolution): Sample = Sample(
+        timeMs = timeMs, lat = lat, lon = lon, accuracyM = accuracyM,
+        cell = cell, registered = false, idSource = r.source, idConfidence = r.confidence,
+        pci = physical.pci, channel = physical.channel,
+        dbm = dbm, rsrq = rsrq, sinr = sinr, subscriptionId = subscriptionId,
+    )
+}
+
+/**
  * One observation of one cell at one position. A saved GPS fix produces one
  * sample for the registered cell and optionally one per neighbor.
  */
@@ -50,6 +75,13 @@ data class Sample(
     val altitudeM: Double? = null,
     val cell: CellKey,
     val registered: Boolean = true,
+    /**
+     * How [cell] was obtained. REPORTED means the phone gave it; the other values
+     * mean it was matched from [pci] and [channel] by the neighbour resolver.
+     */
+    val idSource: IdSource = IdSource.REPORTED,
+    /** The resolver's confidence in [cell], 1 for REPORTED. */
+    val idConfidence: Double = 1.0,
     /** PCI for LTE and NR, PSC for WCDMA. */
     val pci: Int? = null,
     /** EARFCN, NR-ARFCN, UARFCN or ARFCN. */

@@ -22,6 +22,15 @@ import java.time.format.DateTimeFormatter
  * friends) that Android's SQLite does not have. QGIS works without it, just
  * slower on large tables, and can add one itself on a copy of the file.
  *
+ * Neighbour cell ids (see `NeighbourResolver`): `samples.id_source` says where
+ * the row's cell id came from: REPORTED by the phone, RESOLVED or AMBIGUOUS when
+ * matched from the physical id, UNRESOLVED when no match (then `cell` and `site`
+ * are NULL). `id_confidence` is the match's probability, `phys` the physical id
+ * (radio, network, channel, PCI) that was matched, `resolve_n` the number of
+ * candidate cells and `resolve_alts` all of them as
+ * "cellId:probability:distanceM;...". Matches are re-derived as data grows;
+ * `phys`, `pci` and `channel` are the raw facts and never change.
+ *
  * Every feature table carries the time twice: `t` in epoch milliseconds for the
  * app's own queries, and `time` as ISO-8601 text, which is the GeoPackage
  * DATETIME type and what QGIS's temporal tools read. Tables fed by position
@@ -134,8 +143,8 @@ object GpkgSchema {
             speed REAL,
             bearing REAL,
             altitude REAL,
-            cell TEXT NOT NULL,
-            site TEXT NOT NULL,
+            cell TEXT,
+            site TEXT,
             radio TEXT NOT NULL,
             generation INTEGER,
             mcc INTEGER,
@@ -143,6 +152,11 @@ object GpkgSchema {
             area INTEGER,
             cid INTEGER,
             registered BOOLEAN,
+            id_source TEXT NOT NULL DEFAULT 'REPORTED',
+            id_confidence REAL NOT NULL DEFAULT 1,
+            phys TEXT,
+            resolve_n INTEGER,
+            resolve_alts TEXT,
             pci INTEGER,
             channel INTEGER,
             bands TEXT,
@@ -162,7 +176,10 @@ object GpkgSchema {
         )
         """,
         // Also what makes re-importing the same CSV harmless (INSERT OR IGNORE).
-        "CREATE UNIQUE INDEX samples_t_cell ON $SAMPLES (t, cell)",
+        // A neighbour without a cell id is keyed by its physical id instead.
+        "CREATE UNIQUE INDEX samples_key ON $SAMPLES (t, ifnull(cell, phys))",
+        "CREATE INDEX samples_phys ON $SAMPLES (phys) WHERE id_source <> 'REPORTED'",
+        "CREATE INDEX samples_cell ON $SAMPLES (cell)",
         "CREATE INDEX samples_bin ON $SAMPLES (bx, by)",
         """
         CREATE TABLE $CELL_BINS (
@@ -173,6 +190,7 @@ object GpkgSchema {
             bx INTEGER NOT NULL,
             by INTEGER NOT NULL,
             n INTEGER NOT NULL,
+            w_sum REAL NOT NULL,
             mean_dbm REAL NOT NULL,
             ta_n INTEGER NOT NULL DEFAULT 0,
             ta_median INTEGER,

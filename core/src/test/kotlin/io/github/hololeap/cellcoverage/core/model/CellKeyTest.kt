@@ -30,6 +30,13 @@ class CellKeyTest {
     }
 
     @Test
+    fun physicalIdRoundTrips() {
+        val p = PhysicalId(RadioType.TDSCDMA, 460, 0, 10055, 17)
+        assertEquals(p, PhysicalId.fromId(p.toId()))
+        assertNull(PhysicalId.fromId("LTE-232-1-6300-123"))
+    }
+
+    @Test
     fun timingAdvanceDistances() {
         assertEquals(39.06, TimingAdvance.distanceM(RadioType.LTE, 0)!!, 0.01)
         assertEquals(507.78, TimingAdvance.distanceM(RadioType.LTE, 6)!!, 0.01)
